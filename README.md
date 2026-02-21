@@ -8,6 +8,7 @@ Here is the [中文版指南](./README_zh.md).
 
 ## 🔥 Update
 
+- [2025.02.21] Our paper was accepted by CVPR2026.
 - [2026.02.06] We release the WeDetect finetuning code.
 - [2026.02.03] We release the first MLLM-based object embedding model [ObjEmbed](https://github.com/WeChatCV/ObjEmbed) based on WeDetect.
 - [2025.12.16] Release the inference code and paper.
