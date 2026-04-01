@@ -8,6 +8,7 @@ from .mm_backbone import (
     HuggingCLIPLanguageBackbone,
     PseudoLanguageBackbone,
     XLMRobertaLanguageBackbone,
+    LLM2CLIPLanguageBackbone,
     ConvNextVisionBackbone,
     HuggingCLIPVisionBackbone,
     )
@@ -19,5 +20,6 @@ __all__ = [
     'PseudoLanguageBackbone',
     'ConvNextVisionBackbone',
     'XLMRobertaLanguageBackbone',
+    'LLM2CLIPLanguageBackbone',
     'HuggingCLIPVisionBackbone',
 ]

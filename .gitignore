@@ -1,1 +1,6 @@
 *.DS_Store
+data
+data/
+workspace
+workspace/
+__pycache__/

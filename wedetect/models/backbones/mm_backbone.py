@@ -25,6 +25,29 @@ from collections import OrderedDict
 
 
 
+def _pool_text_features(
+    outputs,
+    attention_mask: Tensor,
+    pooling: str = "eos",
+) -> Tensor:
+    if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+        return outputs.text_embeds
+
+    if not hasattr(outputs, "last_hidden_state"):
+        raise ValueError("Text model outputs should contain `last_hidden_state` or `text_embeds`.")
+
+    hidden = outputs.last_hidden_state
+    if pooling == "cls":
+        return hidden[:, 0]
+    if pooling in ("mean", "avg"):
+        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+    if pooling == "eos":
+        last_token_idx = attention_mask.long().sum(dim=1) - 1
+        return hidden[torch.arange(hidden.size(0), device=hidden.device), last_token_idx]
+    raise ValueError(f"Unsupported pooling method: {pooling}")
+
+
 @MODELS.register_module()
 class HuggingCLIPVisionBackbone(BaseModule):
 
@@ -408,6 +431,153 @@ class XLMRobertaLanguageBackbone(BaseModule):
                 for param in module.parameters():
                     param.requires_grad = False
             return
+        for name, module in self.model.named_modules():
+            for frozen_name in self.frozen_modules:
+                if name.startswith(frozen_name):
+                    module.eval()
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    break
+
+    def train(self, mode=True):
+        super().train(mode)
+        self._freeze_modules()
+
+
+@MODELS.register_module()
+class LLM2CLIPLanguageBackbone(BaseModule):
+
+    def __init__(
+        self,
+        model_name: str,
+        output_dim: int = 768,
+        frozen_modules: Sequence[str] = (),
+        adapter_dim: int = 64,
+        adapter_dropout: float = 0.0,
+        use_adapter: bool = True,
+        pooling: str = "eos",
+        max_length: int = 77,
+        trust_remote_code: bool = True,
+        training_use_cache: bool = False,
+        init_cfg: OptMultiConfig = None,
+    ) -> None:
+
+        super().__init__(init_cfg=init_cfg)
+        self.frozen_modules = frozen_modules
+        self.training_use_cache = training_use_cache
+        self.pooling = pooling
+        self.max_length = max_length
+        self.use_adapter = use_adapter
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=trust_remote_code
+        )
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
+
+        self.model = AutoModel.from_pretrained(
+            model_name, trust_remote_code=trust_remote_code
+        )
+        hidden_size = getattr(self.model.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(self.model.config, "d_model", None)
+        if hidden_size is None:
+            raise ValueError("Cannot infer hidden size from model config.")
+
+        if self.use_adapter:
+            self.adapter_norm = nn.LayerNorm(hidden_size)
+            self.adapter_down = nn.Linear(hidden_size, adapter_dim, bias=False)
+            self.adapter_act = nn.GELU()
+            self.adapter_up = nn.Linear(adapter_dim, hidden_size, bias=False)
+            self.adapter_drop = nn.Dropout(adapter_dropout)
+            nn.init.zeros_(self.adapter_up.weight)
+        else:
+            self.adapter_norm = None
+            self.adapter_down = None
+            self.adapter_act = None
+            self.adapter_up = None
+            self.adapter_drop = None
+
+        self.head = nn.Linear(hidden_size, output_dim, bias=True)
+        self._freeze_modules()
+
+    def forward_tokenizer(self, texts):
+        if not hasattr(self, "text"):
+            text = list(itertools.chain(*texts))
+            text = self.tokenizer(
+                text=text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            self.text = text.to(device=self.model.device)
+        return self.text
+
+    def forward(self, text: List[List[str]]) -> Tensor:
+        num_per_batch = [len(t) for t in text]
+        assert max(num_per_batch) == min(
+            num_per_batch
+        ), "number of sequences not equal in batch"
+
+        flat_text = list(itertools.chain(*text))
+        tokenized = self.tokenizer(
+            text=flat_text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+        )
+        tokenized = tokenized.to(device=self.model.device)
+
+        outputs = self.model(**tokenized)
+        txt_feats = _pool_text_features(
+            outputs=outputs,
+            attention_mask=tokenized["attention_mask"],
+            pooling=self.pooling,
+        )
+
+        if self.use_adapter:
+            residual = txt_feats
+            txt_feats = self.adapter_norm(txt_feats)
+            txt_feats = self.adapter_down(txt_feats)
+            txt_feats = self.adapter_act(txt_feats)
+            txt_feats = self.adapter_drop(txt_feats)
+            txt_feats = self.adapter_up(txt_feats)
+            txt_feats = residual + txt_feats
+
+        txt_feats = self.head(txt_feats)
+        txt_feats = F.normalize(txt_feats, dim=-1)
+        txt_feats = txt_feats.reshape(-1, num_per_batch[0], txt_feats.shape[-1])
+        return txt_feats
+
+    def _freeze_modules(self):
+        if len(self.frozen_modules) == 0:
+            return
+
+        if self.frozen_modules[0] == "all":
+            self.model.eval()
+            for _, module in self.model.named_modules():
+                module.eval()
+                for param in module.parameters():
+                    param.requires_grad = False
+
+            self.head.eval()
+            for param in self.head.parameters():
+                param.requires_grad = False
+
+            if self.use_adapter:
+                self.adapter_norm.eval()
+                self.adapter_down.eval()
+                self.adapter_up.eval()
+                for module in (self.adapter_norm, self.adapter_down, self.adapter_up):
+                    for param in module.parameters():
+                        param.requires_grad = False
+            return
+
         for name, module in self.model.named_modules():
             for frozen_name in self.frozen_modules:
                 if name.startswith(frozen_name):
