@@ -20,6 +20,7 @@ from torchvision.transforms.functional import InterpolationMode
 from wedetect.models.backbones.mm_backbone import (
     ConvNextVisionBackbone,
     LLM2CLIPLanguageBackbone,
+    XLMRobertaLanguageBackbone,
 )
 
 
@@ -35,7 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vision-model-size", type=str, default="base",
                         choices=["tiny", "base", "large", "xlarge"])
     parser.add_argument("--vision-init", type=str, default="")
+    parser.add_argument(
+        "--text-backbone",
+        type=str,
+        default="llm2clip",
+        choices=["llm2clip", "xlmroberta"],
+    )
+    parser.add_argument("--text-init", type=str, default="")
     parser.add_argument("--llm2clip-model-name", type=str, default="/ssd/wzh/models/LLM2CLIP-Llama-3.2-1B-Instruct-CC-Finetuned")
+    parser.add_argument("--xlm-roberta-model-name", type=str, default="./xlm-roberta-base")
     parser.add_argument("--llm2clip-max-length", type=int, default=77)
     parser.add_argument("--text-pooling", type=str, default="eos",
                         choices=["eos", "cls", "mean"])
@@ -49,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unfreeze-vision", action="store_true")
 
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -111,7 +120,7 @@ def load_image_text_annotations(
     ann_path: str,
     image_key: str,
     text_key: str,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, str]]:
     path = Path(ann_path)
     if not path.exists():
         raise FileNotFoundError(f"Annotation file not found: {ann_path}")
@@ -140,12 +149,13 @@ def load_image_text_annotations(
     else:
         raise ValueError("Only .json and .jsonl annotations are supported.")
 
-    samples: List[Tuple[str, str]] = []
+    samples: List[Tuple[str, str, str]] = []
     for sample in raw_samples:
         image_path = sample.get(image_key, sample.get("image", ""))
         text = _extract_text_from_sample(sample, text_key)
         if image_path and text:
-            samples.append((str(image_path), text))
+            image_uid = sample.get("image_id", image_path)
+            samples.append((str(image_path), text, str(image_uid)))
     if len(samples) == 0:
         raise ValueError("No valid image-text pairs found in annotation file.")
     return samples
@@ -154,12 +164,16 @@ def load_image_text_annotations(
 class ImageTextDataset(Dataset):
     def __init__(
         self,
-        samples: Sequence[Tuple[str, str]],
+        samples: Sequence[Tuple[str, str, str]],
         data_root: str,
         image_size: int,
     ) -> None:
         self.samples = list(samples)
         self.data_root = Path(data_root) if data_root else None
+        self.uid_to_int: Dict[str, int] = {}
+        for _, _, uid in self.samples:
+            if uid not in self.uid_to_int:
+                self.uid_to_int[uid] = len(self.uid_to_int)
         self.transform = transforms.Compose(
             [
                 transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
@@ -175,19 +189,25 @@ class ImageTextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
-        image_rel, text = self.samples[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, int]:
+        image_rel, text, uid = self.samples[idx]
         image_path = Path(image_rel)
         if not image_path.is_absolute() and self.data_root is not None:
             image_path = self.data_root / image_path
         with Image.open(image_path).convert("RGB") as image:
             image = self.transform(image)
-        return image, text
+        return image, text, self.uid_to_int[uid]
 
 
-def collate_fn(batch: Sequence[Tuple[torch.Tensor, str]]) -> Tuple[torch.Tensor, List[str]]:
-    images, texts = zip(*batch)
-    return torch.stack(images, dim=0), list(texts)
+def collate_fn(
+    batch: Sequence[Tuple[torch.Tensor, str, int]]
+) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
+    images, texts, image_ids = zip(*batch)
+    return (
+        torch.stack(images, dim=0),
+        list(texts),
+        torch.tensor(image_ids, dtype=torch.long),
+    )
 
 
 class Stage1AlignModel(nn.Module):
@@ -201,7 +221,9 @@ class Stage1AlignModel(nn.Module):
     def __init__(
         self,
         vision_model_size: str,
+        text_backbone: str,
         llm2clip_model_name: str,
+        xlm_roberta_model_name: str,
         embed_dim: int,
         adapter_dim: int,
         adapter_dropout: float,
@@ -215,17 +237,27 @@ class Stage1AlignModel(nn.Module):
             model_name=vision_model_size,
             frozen_modules=[],
         )
-        self.text_backbone = LLM2CLIPLanguageBackbone(
-            model_name=llm2clip_model_name,
-            output_dim=embed_dim,
-            adapter_dim=adapter_dim,
-            adapter_dropout=adapter_dropout,
-            use_adapter=use_adapter,
-            pooling=pooling,
-            max_length=max_length,
-            trust_remote_code=trust_remote_code,
-            frozen_modules=[],
-        )
+        self.text_backbone_name = text_backbone
+        if text_backbone == "llm2clip":
+            self.text_backbone = LLM2CLIPLanguageBackbone(
+                model_name=llm2clip_model_name,
+                output_dim=embed_dim,
+                adapter_dim=adapter_dim,
+                adapter_dropout=adapter_dropout,
+                use_adapter=use_adapter,
+                pooling=pooling,
+                max_length=max_length,
+                trust_remote_code=trust_remote_code,
+                frozen_modules=[],
+            )
+        elif text_backbone == "xlmroberta":
+            self.text_backbone = XLMRobertaLanguageBackbone(
+                model_name=xlm_roberta_model_name,
+                model_size=vision_model_size,
+                frozen_modules=[],
+            )
+        else:
+            raise ValueError(f"Unsupported text backbone: {text_backbone}")
         self.image_proj = nn.Linear(self.VISION_LAST_CHANNEL[vision_model_size], embed_dim)
         self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1.0 / 0.07))
 
@@ -274,7 +306,60 @@ def load_vision_init(model: Stage1AlignModel, ckpt_path: str) -> None:
     print(f"[vision-init] missing keys: {len(msg.missing_keys)} unexpected keys: {len(msg.unexpected_keys)}")
 
 
+def load_text_init(model: Stage1AlignModel, ckpt_path: str) -> None:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        ckpt = ckpt["model"]
+    if not isinstance(ckpt, dict):
+        raise ValueError("Unsupported checkpoint format for --text-init")
+
+    text_state = {}
+    for key, value in ckpt.items():
+        if key.startswith("backbone.text_model."):
+            text_state[key.replace("backbone.text_model.", "")] = value
+        elif key.startswith("text_backbone."):
+            text_state[key.replace("text_backbone.", "")] = value
+
+    if len(text_state) == 0:
+        raise ValueError("No text backbone keys found in --text-init checkpoint.")
+
+    model_state = model.text_backbone.state_dict()
+    loadable_state = {}
+    skipped = 0
+    for key, value in text_state.items():
+        if key in model_state and model_state[key].shape == value.shape:
+            loadable_state[key] = value
+        else:
+            skipped += 1
+
+    if len(loadable_state) == 0:
+        raise ValueError(
+            "No compatible text keys can be loaded. "
+            "Please check --text-backbone and --text-init checkpoint."
+        )
+
+    msg = model.text_backbone.load_state_dict(loadable_state, strict=False)
+    print(f"[text-init] loaded from {ckpt_path}")
+    print(
+        f"[text-init] loaded keys: {len(loadable_state)} skipped keys: {skipped} "
+        f"missing keys: {len(msg.missing_keys)} unexpected keys: {len(msg.unexpected_keys)}"
+    )
+
+
 def freeze_modules(model: Stage1AlignModel, freeze_vision: bool, train_text_base: bool) -> None:
+    # ConvNeXt classification tail (`norm` + `head`) is never used in this
+    # stage1 CLIP forward path, so keep it frozen to avoid DDP unused-param errors
+    # when vision backbone is unfrozen.
+    vision_model = model.vision_backbone.model
+    for maybe_unused_name in ("norm", "head"):
+        if hasattr(vision_model, maybe_unused_name):
+            maybe_unused_module = getattr(vision_model, maybe_unused_name)
+            maybe_unused_module.eval()
+            for p in maybe_unused_module.parameters():
+                p.requires_grad = False
+
     if freeze_vision:
         for p in model.vision_backbone.parameters():
             p.requires_grad = False
@@ -286,40 +371,68 @@ def freeze_modules(model: Stage1AlignModel, freeze_vision: bool, train_text_base
         model.text_backbone.model.eval()
 
 
-def gather_features(image_features: torch.Tensor, text_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def gather_features(
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    image_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not dist.is_available() or not dist.is_initialized():
-        return image_features, text_features
+        return image_features, text_features, image_ids
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     all_image = [torch.zeros_like(image_features) for _ in range(world_size)]
     all_text = [torch.zeros_like(text_features) for _ in range(world_size)]
+    all_ids = [torch.zeros_like(image_ids) for _ in range(world_size)]
 
     dist.all_gather(all_image, image_features.detach())
     dist.all_gather(all_text, text_features.detach())
+    dist.all_gather(all_ids, image_ids)
     all_image[rank] = image_features
     all_text[rank] = text_features
 
-    return torch.cat(all_image, dim=0), torch.cat(all_text, dim=0)
+    return (
+        torch.cat(all_image, dim=0),
+        torch.cat(all_text, dim=0),
+        torch.cat(all_ids, dim=0),
+    )
+
+
+def _multi_positive_nce_loss(logits: torch.Tensor, positive_mask: torch.Tensor) -> torch.Tensor:
+    # -log( sum(exp(pos_logits)) / sum(exp(all_logits)) )
+    # positive_mask shape: [N, M], at least one positive per row.
+    neg_inf = torch.finfo(logits.dtype).min
+    pos_logits = logits.masked_fill(~positive_mask, neg_inf)
+    pos_logsumexp = torch.logsumexp(pos_logits, dim=1)
+    all_logsumexp = torch.logsumexp(logits, dim=1)
+    return -(pos_logsumexp - all_logsumexp).mean()
 
 
 def clip_loss(
     image_features: torch.Tensor,
     text_features: torch.Tensor,
     logit_scale: torch.Tensor,
+    image_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    all_image, all_text = gather_features(image_features, text_features)
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    batch_size = image_features.size(0)
-    labels = torch.arange(batch_size, device=image_features.device) + rank * batch_size
+    all_image, all_text, all_ids = gather_features(image_features, text_features, image_ids)
 
     logits_per_image = logit_scale * image_features @ all_text.t()
     logits_per_text = logit_scale * text_features @ all_image.t()
 
-    loss_i2t = F.cross_entropy(logits_per_image, labels)
-    loss_t2i = F.cross_entropy(logits_per_text, labels)
+    # Multi-positive: all captions/images from the same image id are positives.
+    positive_mask_i2t = image_ids[:, None].eq(all_ids[None, :])
+    positive_mask_t2i = image_ids[:, None].eq(all_ids[None, :])
+
+    loss_i2t = _multi_positive_nce_loss(logits_per_image, positive_mask_i2t)
+    loss_t2i = _multi_positive_nce_loss(logits_per_text, positive_mask_t2i)
     loss = 0.5 * (loss_i2t + loss_t2i)
-    acc = (logits_per_image.argmax(dim=-1) == labels).float().mean()
+
+    # Top1 retrieval is correct if predicted sample belongs to any positive pair.
+    pred_txt_top1 = logits_per_image.argmax(dim=-1)
+    pred_img_top1 = logits_per_text.argmax(dim=-1)
+    acc_i2t = all_ids[pred_txt_top1].eq(image_ids).float().mean()
+    acc_t2i = all_ids[pred_img_top1].eq(image_ids).float().mean()
+    acc = 0.5 * (acc_i2t + acc_t2i)
     return loss, acc
 
 
@@ -433,11 +546,12 @@ def evaluate(
     total_acc = 0.0
     total_count = 0
 
-    for images, texts in loader:
+    for images, texts, image_ids in loader:
         images = images.to(device, non_blocking=True)
+        image_ids = image_ids.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             image_features, text_features, logit_scale = model(images, texts)
-            loss, acc = clip_loss(image_features, text_features, logit_scale)
+            loss, acc = clip_loss(image_features, text_features, logit_scale, image_ids)
 
         batch = images.size(0)
         total_loss += loss.item() * batch
@@ -500,7 +614,9 @@ def main() -> None:
 
     raw_model = Stage1AlignModel(
         vision_model_size=args.vision_model_size,
+        text_backbone=args.text_backbone,
         llm2clip_model_name=args.llm2clip_model_name,
+        xlm_roberta_model_name=args.xlm_roberta_model_name,
         embed_dim=args.embed_dim,
         adapter_dim=args.adapter_dim,
         adapter_dropout=args.adapter_dropout,
@@ -512,6 +628,8 @@ def main() -> None:
 
     if args.vision_init:
         load_vision_init(raw_model, args.vision_init)
+    if args.text_init:
+        load_text_init(raw_model, args.text_init)
 
     freeze_modules(raw_model, freeze_vision=not args.unfreeze_vision, train_text_base=args.train_text_base)
     raw_model.to(device)
@@ -569,13 +687,14 @@ def main() -> None:
         running_acc = 0.0
         running_steps = 0
 
-        for step, (images, texts) in enumerate(train_loader):
+        for step, (images, texts, image_ids) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
+            image_ids = image_ids.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 image_features, text_features, logit_scale = model(images, texts)
-                loss, acc = clip_loss(image_features, text_features, logit_scale)
+                loss, acc = clip_loss(image_features, text_features, logit_scale, image_ids)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()

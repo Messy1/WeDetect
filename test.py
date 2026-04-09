@@ -6,6 +6,8 @@ import os.path as osp
 import warnings
 from copy import deepcopy
 
+import numpy as np
+
 from mmengine import ConfigDict
 from mmengine.config import Config, DictAction
 from mmengine.runner import Runner
@@ -14,6 +16,11 @@ from mmdet.engine.hooks.utils import trigger_visualization_hook
 from mmdet.evaluation import DumpDetResults
 from mmdet.registry import RUNNERS
 from mmdet.utils import setup_cache_size_limit_of_dynamo
+
+
+# NumPy 2.x removed legacy aliases (e.g. np.float) still used by old LVIS API.
+if not hasattr(np, 'float'):
+    np.float = float
 
 
 # TODO: support fuse_conv_bn and format_only

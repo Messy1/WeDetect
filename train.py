@@ -3,11 +3,18 @@ import argparse
 import os
 import os.path as osp
 
+import numpy as np
+
 from mmengine.config import Config, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet.utils import setup_cache_size_limit_of_dynamo
+
+
+# NumPy 2.x removed legacy aliases (e.g. np.float) still used by old LVIS API.
+if not hasattr(np, 'float'):
+    np.float = float
 
 
 def parse_args():
