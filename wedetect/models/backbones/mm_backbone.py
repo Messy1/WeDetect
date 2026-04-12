@@ -1,6 +1,6 @@
 # Copyright (c) Tencent Inc. All rights reserved.
 import itertools
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Optional
 import torch
 from torch import Tensor
 from torch.nn.modules.batchnorm import _BatchNorm
@@ -22,6 +22,11 @@ import os.path as osp
 import collections
 import math
 from collections import OrderedDict
+
+try:
+    import open_clip
+except ImportError:
+    open_clip = None
 
 
 
@@ -585,6 +590,174 @@ class LLM2CLIPLanguageBackbone(BaseModule):
                     for param in module.parameters():
                         param.requires_grad = False
                     break
+
+    def train(self, mode=True):
+        super().train(mode)
+        self._freeze_modules()
+
+
+class OpenCLIPTextTower(nn.Module):
+    """Minimal OpenCLIP text tower used for exporting/loading text-only states."""
+
+    def __init__(self, openclip_model: nn.Module) -> None:
+        super().__init__()
+        self.token_embedding = openclip_model.token_embedding
+        self.positional_embedding = nn.Parameter(
+            openclip_model.positional_embedding.detach().clone()
+        )
+        self.transformer = openclip_model.transformer
+        self.ln_final = openclip_model.ln_final
+        if getattr(openclip_model, "text_projection", None) is not None:
+            self.text_projection = nn.Parameter(
+                openclip_model.text_projection.detach().clone()
+            )
+            self.output_dim = int(self.text_projection.shape[-1])
+        else:
+            self.text_projection = None
+            self.output_dim = int(self.ln_final.weight.shape[0])
+
+        self.context_length = int(getattr(openclip_model, "context_length", 77))
+        attn_mask = getattr(openclip_model, "attn_mask", None)
+        if attn_mask is not None:
+            self.register_buffer("attn_mask", attn_mask.detach().clone(), persistent=False)
+        else:
+            self.attn_mask = None
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        x = self.token_embedding(token_ids)
+        pos = self.positional_embedding[: x.shape[1]]
+        x = x + pos
+        x = x.permute(1, 0, 2)
+        if self.attn_mask is not None:
+            attn_mask = self.attn_mask[: x.shape[0], : x.shape[0]]
+            x = self.transformer(x, attn_mask=attn_mask)
+        else:
+            x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        # OpenCLIP convention: eot token id is the largest id in each sequence.
+        eot_idx = token_ids.argmax(dim=-1)
+        x = x[torch.arange(x.shape[0], device=x.device), eot_idx]
+        if self.text_projection is not None:
+            x = x @ self.text_projection
+        return x
+
+
+@MODELS.register_module()
+class OpenCLIPTextLanguageBackbone(BaseModule):
+    """OpenCLIP text backbone with an extra trainable projection to WeDetect dim.
+
+    Notes:
+        1) Uses OpenCLIP native tokenizer + text encoding path.
+        2) Keeps OpenCLIP text output dim (e.g. 640) internally.
+        3) Adds a trainable `text_proj` (clip_dim -> output_dim), then normalize.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        pretrained: Optional[str] = None,
+        output_dim: int = 768,
+        max_length: Optional[int] = None,
+        frozen_modules: Sequence[str] = (),
+        training_use_cache: bool = False,
+        init_cfg: OptMultiConfig = None,
+    ) -> None:
+        super().__init__(init_cfg=init_cfg)
+
+        if open_clip is None:
+            raise ImportError(
+                "open_clip is required for OpenCLIPTextLanguageBackbone. "
+                "Please install open-clip-torch first."
+            )
+
+        self.model_name = model_name
+        self.pretrained = pretrained
+        self.frozen_modules = frozen_modules
+        self.training_use_cache = training_use_cache
+
+        model_name_for_openclip = model_name
+        if "/" in model_name and not model_name.startswith("hf-hub:") and not pretrained:
+            # HuggingFace hub style id, e.g. laion/CLIP-xxx
+            model_name_for_openclip = f"hf-hub:{model_name}"
+
+        model, _, _ = self._create_openclip_model(model_name_for_openclip, pretrained)
+        self.model = OpenCLIPTextTower(model)
+        self.clip_embed_dim = int(self.model.output_dim)
+        self.text_proj = nn.Linear(self.clip_embed_dim, output_dim, bias=True)
+        self.max_length = int(max_length or getattr(self.model, "context_length", 77))
+
+        self.tokenizer = self._create_openclip_tokenizer(model_name_for_openclip)
+        self._freeze_modules()
+
+    def _create_openclip_model(self, model_name: str, pretrained: Optional[str]):
+        kwargs = dict(device="cpu", precision="fp32")
+        if pretrained:
+            return open_clip.create_model_and_transforms(
+                model_name=model_name, pretrained=pretrained, **kwargs
+            )
+        # For hf-hub models, `pretrained` should be omitted/None.
+        try:
+            return open_clip.create_model_and_transforms(
+                model_name=model_name, pretrained=None, **kwargs
+            )
+        except Exception:
+            return open_clip.create_model_and_transforms(model_name=model_name, **kwargs)
+
+    def _create_openclip_tokenizer(self, model_name: str):
+        try:
+            return open_clip.get_tokenizer(model_name)
+        except Exception:
+            # Fallback for older versions that do not accept hf-hub prefix.
+            if model_name.startswith("hf-hub:"):
+                return open_clip.get_tokenizer(model_name[len("hf-hub:") :])
+            raise
+
+    def _freeze_one_module(self, module: nn.Module) -> None:
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _freeze_modules(self):
+        if len(self.frozen_modules) == 0:
+            return
+
+        if self.frozen_modules[0] == "all":
+            self._freeze_one_module(self.model)
+            self._freeze_one_module(self.text_proj)
+            return
+
+        for frozen_name in self.frozen_modules:
+            if frozen_name.startswith("model"):
+                self._freeze_one_module(self.model)
+            elif frozen_name.startswith("text_proj"):
+                self._freeze_one_module(self.text_proj)
+
+    def forward_tokenizer(self, texts):
+        flat_text = list(itertools.chain(*texts))
+        token_ids = self.tokenizer(flat_text)
+        if isinstance(token_ids, dict):
+            token_ids = token_ids["input_ids"]
+        if token_ids.shape[1] > self.max_length:
+            token_ids = token_ids[:, : self.max_length]
+        return token_ids
+
+    def forward(self, text: List[List[str]]) -> Tensor:
+        num_per_batch = [len(t) for t in text]
+        assert max(num_per_batch) == min(
+            num_per_batch
+        ), "number of sequences not equal in batch"
+
+        token_ids = self.forward_tokenizer(text)
+        if not torch.is_tensor(token_ids):
+            token_ids = torch.as_tensor(token_ids)
+        token_ids = token_ids.to(device=next(self.model.parameters()).device)
+
+        txt_feats = self.model(token_ids)
+        txt_feats = self.text_proj(txt_feats)
+        txt_feats = F.normalize(txt_feats, dim=-1)
+        txt_feats = txt_feats.reshape(-1, num_per_batch[0], txt_feats.shape[-1])
+        return txt_feats
 
     def train(self, mode=True):
         super().train(mode)
